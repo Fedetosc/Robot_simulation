@@ -1,8 +1,7 @@
-"""
-G1 Robot Simulation with Mujoco and RL Policy.
-"""
-
 import time
+import socket
+import threading
+import json
 from pathlib import Path
 
 import mujoco
@@ -17,80 +16,84 @@ from observer import build_observation, compute_gait_phase, get_gravity_orientat
 
 
 class Simulation:
-    """
-    Main simulation class for G1 robot walking.
-
-    Handles:
-        - Mujoco model loading and stepping
-        - RL policy inference
-        - PD control loop
-        - Observation building
-    """
-
     def __init__(
         self,
         sim_cfg: SimulationConfig,
         ctrl_cfg: ControlConfig,
         obs_cfg: ObservationConfig,
+        start_server: bool = False
     ):
-        """
-        Initialize simulation.
-
-        Args:
-            sim_cfg: Simulation timing configuration
-            ctrl_cfg: Controller gains and default positions
-            obs_cfg: Observation scaling configuration
-        """
         self.sim_cfg = sim_cfg
         self.ctrl_cfg = ctrl_cfg
         self.obs_cfg = obs_cfg
 
-        # Convert configs to numpy arrays
+        # Conversione parametri
         self.kps = np.array(ctrl_cfg.kps, dtype=np.float32)
         self.kds = np.array(ctrl_cfg.kds, dtype=np.float32)
         self.default_angles = np.array(ctrl_cfg.default_angles, dtype=np.float32)
         self.cmd_scale = np.array(obs_cfg.cmd_scale, dtype=np.float32)
         self.cmd = np.array(obs_cfg.cmd_init, dtype=np.float32)
 
-        # State variables
+        # Variabili di stato
         self.action = np.zeros(ctrl_cfg.num_actions, dtype=np.float32)
         self.target_dof_pos = self.default_angles.copy()
-        self.obs = np.zeros(obs_cfg.num_obs, dtype=np.float32)
         self.counter = 0
 
-        # Load Mujoco model
+        # Caricamento Mujoco
         self.model = mujoco.MjModel.from_xml_path(sim_cfg.xml_path)
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = sim_cfg.simulation_dt
 
-        # Load RL policy
-        policy_path = Path(sim_cfg.policy_path)
-        self.policy = torch.jit.load(policy_path)
+        # Caricamento RL Policy
+        self.policy = torch.jit.load(Path(sim_cfg.policy_path))
         self.policy.eval()
 
-    def _compute_phase(self) -> float:
-        """Compute current gait phase."""
-        return compute_gait_phase(self.counter, self.sim_cfg.simulation_dt)
+        # Avvio Server Socket se richiesto
+        if start_server:
+            self.host = "localhost"
+            self.port = 9999
+            self.server_thread = threading.Thread(target=self._run_server, daemon=True)
+            self.server_thread.start()
+            print(f"[*] Server in ascolto su {self.host}:{self.port}")
 
-    def _build_observation(
-        self,
-        qj: NDArray[np.floating],
-        dqj: NDArray[np.floating],
-        quat: NDArray[np.floating],
-        omega: NDArray[np.floating],
-    ) -> NDArray[np.floating]:
-        """Build observation vector from robot state."""
-        gravity = get_gravity_orientation(quat)
-        phase = self._compute_phase()
+    def _run_server(self):
+        """Thread per ricevere comandi JSON dal commander.py"""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.host, self.port))
+            s.listen()
+            while True:
+                conn, addr = s.accept()
+                with conn:
+                    data = conn.recv(1024).decode()
+                    if not data: continue
+                    msg = json.loads(data)
+                    response = {"status": "ok"}
 
-        return build_observation(
-            omega=omega,
-            gravity=gravity,
-            cmd=self.cmd,
-            qj=qj,
-            dqj=dqj,
-            action=self.action,
-            phase=phase,
+                    if "cmd" in msg:
+                        self.cmd = np.array(msg["cmd"], dtype=np.float32)
+                        response["new_cmd"] = self.cmd.tolist()
+                    if "stop" in msg:
+                        self.cmd = np.zeros(3, dtype=np.float32)
+                    if "reset" in msg:
+                        mujoco.mj_resetData(self.model, self.data)
+                        self.counter = 0
+                    if "get_state" in msg:
+                        response["pos"] = self.data.qpos[:3].tolist()
+                    
+                    conn.sendall(json.dumps(response).encode())
+
+    def _update_policy(self) -> None:
+        """Inference della rete neurale"""
+        qj = self.data.qpos[7:7+self.ctrl_cfg.num_actions]
+        dqj = self.data.qvel[6:6+self.ctrl_cfg.num_actions]
+        quat = self.data.qpos[3:7]
+        omega = self.data.qvel[3:6]
+
+        obs = build_observation(
+            omega=omega, gravity=get_gravity_orientation(quat),
+            cmd=self.cmd, qj=qj, dqj=dqj, action=self.action,
+            phase=compute_gait_phase(self.counter, self.sim_cfg.simulation_dt),
             ang_vel_scale=self.obs_cfg.ang_vel_scale,
             dof_pos_scale=self.obs_cfg.dof_pos_scale,
             dof_vel_scale=self.obs_cfg.dof_vel_scale,
@@ -99,15 +102,14 @@ class Simulation:
             num_actions=self.ctrl_cfg.num_actions,
         )
 
-    def _infer_policy(self, obs: NDArray[np.floating]) -> NDArray[np.floating]:
-        """Run RL policy inference."""
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)
-        action = self.policy(obs_tensor).detach().numpy().squeeze()
-        return action.astype(np.float32)
+        self.action = self.policy(obs_tensor).detach().numpy().squeeze().astype(np.float32)
+        self.target_dof_pos = self.action * self.obs_cfg.action_scale + self.default_angles
 
-    def _apply_pd_control(self) -> None:
-        """Apply PD control torque to actuators."""
-        tau = pd_control(
+    def step(self) -> None:
+        """Passo di simulazione: 500Hz PD, 50Hz Policy"""
+        # PD Control (Torque)
+        self.data.ctrl[:self.ctrl_cfg.num_actions] = pd_control(
             target_q=self.target_dof_pos,
             q=self.data.qpos[7:7+self.ctrl_cfg.num_actions],
             kp=self.kps,
@@ -115,82 +117,37 @@ class Simulation:
             dq=self.data.qvel[6:6+self.ctrl_cfg.num_actions],
             kd=self.kds,
         )
-        self.data.ctrl[:self.ctrl_cfg.num_actions] = tau
 
-    def _update_policy(self) -> None:
-        """Update policy action and target joint positions."""
-        # Read robot state
-        qj = self.data.qpos[7:7+self.ctrl_cfg.num_actions]
-        dqj = self.data.qvel[6:6+self.ctrl_cfg.num_actions]
-        quat = self.data.qpos[3:7]
-        omega = self.data.qvel[3:6]
-
-        # Build observation and infer policy
-        self.obs = self._build_observation(qj, dqj, quat, omega)
-        self.action = self._infer_policy(self.obs)
-
-        # Convert action to target joint positions
-        self.target_dof_pos = self.action * self.obs_cfg.action_scale + self.default_angles
-
-    def step(self) -> None:
-        """Execute one simulation step."""
-        # Apply PD control (runs at 500Hz)
-        self._apply_pd_control()
-
-        # Advance physics
         mujoco.mj_step(self.model, self.data)
         self.counter += 1
 
-        # Update policy at control frequency (50Hz)
+        # Control Decimation (Policy Update)
         if self.counter % self.sim_cfg.control_decimation == 0:
             self._update_policy()
 
     def run(self) -> None:
-        """
-        Run the simulation with visualizer.
-        """
-        print(f"Robot caricato: {self.model.nu} attuatori")
-        print(f"Comando velocità: vx={self.cmd[0]}, vy={self.cmd[1]}, vyaw={self.cmd[2]}")
-        print(
-            f"Simulazione: {self.sim_cfg.simulation_duration}s a "
-            f"{1/self.sim_cfg.simulation_dt:.0f}Hz fisico, "
-            f"policy a {1/(self.sim_cfg.simulation_dt * self.sim_cfg.control_decimation):.0f}Hz"
-        )
+        """Loop principale con visualizzatore"""
+        with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
+            # Configurazione camera
+            viewer.cam.distance, viewer.cam.elevation, viewer.cam.azimuth = 5.0, -15, 90
+            
+            while viewer.is_running():
+                step_start = time.time()
+                self.step()
+                viewer.sync()
 
-        try:
-            with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
-                # Camera setup
-                viewer.cam.distance = 5.0
-                viewer.cam.elevation = -15
-                viewer.cam.azimuth = 90
-
-                start = time.time()
-
-                while viewer.is_running() and time.time() - start < self.sim_cfg.simulation_duration:
-                    step_start = time.time()
-
-                    self.step()
-
-                    viewer.sync()
-
-                    # Real-time pacing
-                    elapsed = time.time() - step_start
-                    sleep_time = self.model.opt.timestep - elapsed
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-
-        except KeyboardInterrupt:
-            print("Interrotto dall'utente.")
-        except Exception as e:
-            print(f"Errore: {e}")
-            import traceback
-            traceback.print_exc()
-
-        print("Simulazione completata.")
+                # Sincronizzazione tempo reale
+                elapsed = time.time() - step_start
+                if self.model.opt.timestep > elapsed:
+                    time.sleep(self.model.opt.timestep - elapsed)
 
 
-def run_simulation():
-    """Entry point for running the simulation."""
+def run_simulation(is_server: bool = False):
     sim_cfg, ctrl_cfg, obs_cfg = load_config()
-    sim = Simulation(sim_cfg, ctrl_cfg, obs_cfg)
+    
+    # Se server, ignora il cammino automatico iniziale
+    if is_server:
+        obs_cfg.cmd_init = [0.0, 0.0, 0.0]
+        
+    sim = Simulation(sim_cfg, ctrl_cfg, obs_cfg, start_server=is_server)
     sim.run()
