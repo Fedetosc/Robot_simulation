@@ -51,7 +51,7 @@ def load_config(config_path: Path | None = None) -> tuple[SimulationConfig, Cont
         Tuple of (SimulationConfig, ControlConfig, ObservationConfig)
     """
     if config_path is None:
-        config_path = Path(__file__).parent.parent / "config.yaml"
+        config_path = Path(__file__).parent / "config.yaml"
 
     with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)

@@ -160,7 +160,7 @@ class Simulation:
         try:
             with mujoco.viewer.launch_passive(self.model, self.data) as viewer:
                 # Camera setup
-                viewer.cam.distance = 3.0
+                viewer.cam.distance = 5.0
                 viewer.cam.elevation = -15
                 viewer.cam.azimuth = 90
 
