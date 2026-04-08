@@ -1,0 +1,95 @@
+# ============================================================
+# PATHS
+# ============================================================
+
+# Modello RL pre-trained del G1 (rete neurale TorchScript)
+# Cambia questo path se usi un modello custom allenato da te
+policy_path: "unitree_rl_gym/deploy/pre_train/g1/motion.pt"
+
+# Modello 3D del robot per Mujoco (MJCF format)
+# scene.xml include il terreno, luci e il robot
+xml_path: "unitree_rl_gym/resources/robots/g1_description/scene.xml"
+
+# ============================================================
+# TIMING SIMULAZIONE
+# ============================================================
+
+# Durata totale della simulazione in secondi
+simulation_duration: 10.0
+
+# Timestep fisico in secondi (2ms = 500Hz)
+# Più basso = più preciso ma più lento
+simulation_dt: 0.002
+
+# La policy RL gira ogni N step fisici
+# 10 step * 2ms = 20ms = 50Hz
+# La policy è stata addestrata a 50Hz, non cambiare questo valore
+control_decimation: 10
+
+# ============================================================
+# GUADAGNI PD (solo per le 12 joints delle gambe)
+# Ordine: [hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll] x2
+# ============================================================
+
+# Guadagno proporzionale: quanto forte il motore segue la posizione target
+# Valori alti = risposta rapida ma possibili oscillazioni
+kps: [100, 100, 100, 150, 40, 40,
+      100, 100, 100, 150, 40, 40]
+
+# Guadagno derivativo: smorzamento (resistenza al cambiamento)
+# Valori alti = più smorzato, meno oscillazioni
+kds: [2, 2, 2, 4, 2, 2,
+      2, 2, 2, 4, 2, 2]
+
+# ============================================================
+# POSIZIONE DI DEFAULT (radianti)
+# È la postura in piedi di riferimento
+# Ordine: [hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll] x2
+# ============================================================
+default_angles: [
+  -0.1,  0.0,  0.0,  0.3, -0.2,  0.0,   # gamba sinistra
+  -0.1,  0.0,  0.0,  0.3, -0.2,  0.0    # gamba destra
+]
+
+# ============================================================
+# SCALING OSSERVAZIONI
+# Normalizzano i valori fisici per la rete neurale
+# ============================================================
+
+# Scala velocità angolare IMU (omega)
+# 0.25 significa che 4 rad/s diventa 1.0 per la rete
+ang_vel_scale: 0.25
+
+# Scala posizioni joint (1.0 = nessuna modifica)
+dof_pos_scale: 1.0
+
+# Scala velocità joint
+# 0.05 significa che 20 rad/s diventa 1.0 per la rete
+dof_vel_scale: 0.05
+
+# Scala output della policy → radianti
+# 0.25 significa che la rete può muovere i joint di max ±0.25 rad
+# rispetto alla default_angles
+action_scale: 0.25
+
+# Scala del comando velocità [vx, vy, vyaw]
+cmd_scale: [2.0, 2.0, 0.25]
+
+# ============================================================
+# DIMENSIONI VETTORI
+# ============================================================
+
+# Numero di joint controllati (solo gambe, no braccia)
+num_actions: 12
+
+# Dimensione totale del vettore osservazione:
+# 3 (omega) + 3 (gravity) + 3 (cmd) + 12 (qj) + 12 (dqj) + 12 (action) + 2 (phase) = 47
+num_obs: 47
+
+# ============================================================
+# COMANDO VELOCITÀ INIZIALE [vx, vy, vyaw]
+# vx:   velocità avanti/indietro (m/s)
+# vy:   velocità laterale (m/s)  
+# vyaw: velocità di rotazione (rad/s)
+# ============================================================
+cmd_init: [0.5, 0.0, 0.0]   # cammina avanti a 0.5 m/s
