@@ -9,6 +9,7 @@ policy_path: "unitree_rl_gym/deploy/pre_train/g1/motion.pt"
 # Modello 3D del robot per Mujoco (MJCF format)
 # scene.xml include il terreno, luci e il robot
 xml_path: "unitree_rl_gym/resources/robots/g1_description/scene.xml"
+# xml_path: "unitree_rl_gym/resources/robots/g1_description/g1_29dof_with_hand.xml"
 
 # ============================================================
 # TIMING SIMULAZIONE

@@ -1,7 +1,7 @@
 import time
+import json
 import socket
 import threading
-import json
 from pathlib import Path
 
 import mujoco
@@ -9,7 +9,7 @@ import mujoco.viewer
 import numpy as np
 import torch
 
-from config import load_config, ControlConfig, ObservationConfig, SimulationConfig
+from config import ControlConfig, ObservationConfig, SimulationConfig
 from controller import pd_control
 from observer import build_observation, compute_gait_phase, get_gravity_orientation
 
@@ -52,6 +52,9 @@ class Simulation:
         self.action = np.zeros(ctrl_cfg.num_actions, dtype=np.float32)  # Output della policy RL
         self.target_dof_pos = self.default_angles.copy()  # Posizioni target delle giunture
         self.counter = 0  # Contatore passi di simulazione
+        self.stopped = False
+        self.frozen_qpos = None
+        self.frozen_qvel = None
 
         # Caricamento modello MuJoCo dal file XML
         logger.info(f"Caricamento modello MuJoCo da: {sim_cfg.xml_path}")
@@ -102,18 +105,32 @@ class Simulation:
 
                     if "cmd" in msg:
                         old_cmd = self.cmd.copy()
+                        self.stopped = False   # 🔥 SBLOCCA QUI
                         self.cmd = np.array(msg["cmd"], dtype=np.float32)
                         response["new_cmd"] = self.cmd.tolist()
                         logger.info(f"[SERVER] Nuovo comando: {old_cmd} -> {self.cmd}")
 
                     if "stop" in msg:
+                        self.stopped = True
+                        self.frozen_qpos = self.data.qpos.copy()
+                        self.frozen_qvel = self.data.qvel.copy()
                         self.cmd = np.zeros(3, dtype=np.float32)
-                        logger.info("[SERVER] STOP - Comando azzerato")
+
+                        response["status"] = "stopped"
+                        logger.info("[SERVER] STOP - Robot congelato nella posa attuale")
 
                     if "reset" in msg:
                         mujoco.mj_resetData(self.model, self.data)
+                        mujoco.mj_forward(self.model, self.data)
+
                         self.counter = 0
-                        logger.info("[SERVER] RESET - Dati simulazione resettati")
+                        self.stopped = False
+                        self.cmd = np.zeros(3, dtype=np.float32)
+
+                        # opzionale ma consigliato
+                        self.target_dof_pos = self.default_angles.copy()
+
+                        logger.info("[SERVER] RESET - Simulazione completamente resettata")
 
                     if "get_state" in msg:
                         response["pos"] = self.data.qpos[:3].tolist()
@@ -133,13 +150,6 @@ class Simulation:
         quat = self.data.qpos[3:7]  # Orientamento del corpo (quaternioni)
         omega = self.data.qvel[3:6]  # Velocità angolare del corpo
 
-        # print(f"[POLICY] === Inference RL ===")
-        # print(f"[POLICY]   qj (pos giunture): {qj}")
-        # print(f"[POLICY]   dqj (vel giunture): {dqj}")
-        # print(f"[POLICY]   quat (orientamento): {quat}")
-        # print(f"[POLICY]   omega (vel angolare): {omega}")
-        # print(f"[POLICY]   cmd (comando): {self.cmd}")
-
         # Costruzione del vettore di osservazione per la policy
         obs = build_observation(
             omega=omega, gravity=get_gravity_orientation(quat),
@@ -153,8 +163,6 @@ class Simulation:
             num_actions=self.ctrl_cfg.num_actions,
         )
 
-        # print(f"[POLICY]   Osservazione costruita (shape: {obs.shape})")
-
         # Inference della rete neurale
         obs_tensor = torch.from_numpy(obs).unsqueeze(0)  # Aggiungo batch dimension
         self.action = self.policy(obs_tensor).detach().numpy().squeeze().astype(np.float32)
@@ -162,11 +170,19 @@ class Simulation:
         # Calcolo posizioni target dalle azioni della policy
         self.target_dof_pos = self.action * self.obs_cfg.action_scale + self.default_angles
 
-        # print(f"[POLICY]   Output policy: {self.action}")
-        # print(f"[POLICY]   Target dof pos: {self.target_dof_pos}")
-        # print(f"[POLICY] ===================")
-
     def step(self) -> None:
+
+        if self.stopped:
+            # mantieni tutto fermo nella posa corrente
+            self.data.qvel[:] = 0
+            self.data.ctrl[:] = 0
+
+            # IMPORTANTISSIMO: non toccare qpos orientation
+            self.data.qpos[:] = self.frozen_qpos
+
+            mujoco.mj_forward(self.model, self.data)
+            return
+        
         current_q = self.data.qpos[7:7+self.ctrl_cfg.num_actions]
         current_dq = self.data.qvel[6:6+self.ctrl_cfg.num_actions]
 
@@ -202,13 +218,6 @@ class Simulation:
         mujoco.mj_step(self.model, self.data)
         self.counter += 1
 
-        # if self.counter % 50 == 0 and np.linalg.norm(self.cmd) <= 0.05:
-            # print(f"qpos base: {self.data.qpos[:3]}")
-            # print(f"quat: {self.data.qpos[3:7]}")
-            # print(f"joints: {self.data.qpos[7:19]}")
-            # print(f"target: {self.target_dof_pos}")
-            # print(f"errore: {self.target_dof_pos - self.data.qpos[7:19]}")
-
         if self.counter % self.sim_cfg.control_decimation == 0:
             if np.linalg.norm(self.cmd) > 0.05:
                 self._update_policy()
@@ -236,58 +245,15 @@ class Simulation:
             logger.info(f"[RUN] Visualizzatore avviato - Camera: distance={viewer.cam.distance}, elevation={viewer.cam.elevation}, azimuth={viewer.cam.azimuth}")
             logger.info("[RUN] Entro nel ciclo di simulazione...")
 
-            step_count = 0
             while viewer.is_running():
                 step_start = time.time()
 
                 self.step()  # Esegue un passo di simulazione
                 viewer.sync()  # Sincronizza il visualizzatore
 
-                step_count += 1
-                # if step_count % 100 == 0:
-                #     logger.info(f"[RUN] ... {step_count} passi eseguiti ...")
-
                 # Sincronizzazione tempo reale - aspetta se il passo è stato troppo veloce
                 elapsed = time.time() - step_start
                 if self.model.opt.timestep > elapsed:
                     time.sleep(self.model.opt.timestep - elapsed)
 
-            logger.info(f"[RUN] Simulazione terminata dopo {step_count} passi totali")
-
-
-def run_simulation(is_server: bool = False):
-    """
-    Funzione entry point per avviare la simulazione.
-
-    Args:
-        is_server: Se True, avvia il server socket per ricevere comandi esterni
-                   e imposta il comando iniziale a zero (nessun movimento automatico)
-    """
-    logger.info("\n" + "="*60)
-    logger.info("[MAIN] === Avvio Simulazione Robot ===")
-    logger.info("="*60)
-
-    # Caricamento configurazioni dai file YAML
-    logger.info("[MAIN] Caricamento configurazioni...")
-    sim_cfg, ctrl_cfg, obs_cfg = load_config()
-
-    logger.info(f"[MAIN]   Simulation config: dt={sim_cfg.simulation_dt}, decimation={sim_cfg.control_decimation}")
-    logger.info(f"[MAIN]   Control config: num_actions={ctrl_cfg.num_actions}")
-    logger.info(f"[MAIN]   Observation config: cmd_init={obs_cfg.cmd_init}")
-
-    # Se server, ignora il cammino automatico iniziale
-    if is_server:
-        logger.info("[MAIN] Modalità SERVER: comando iniziale azzerato (attesa comandi esterni)")
-        obs_cfg.cmd_init = [0.0, 0.0, 0.0]
-    else:
-        logger.info("[MAIN] Modalità STANDALONE: comando iniziale =", obs_cfg.cmd_init)
-
-    # Creazione istanza della simulazione
-    logger.info("[MAIN] Creazione istanza Simulation...")
-    sim = Simulation(sim_cfg, ctrl_cfg, obs_cfg, start_server=is_server)
-
-    # Avvio del loop principale
-    logger.info("[MAIN] Avvio simulazione...\n")
-    sim.run()
-
-    logger.info("[MAIN] === Simulazione terminata ===\n")
+            logger.info(f"[RUN] Simulazione terminata")

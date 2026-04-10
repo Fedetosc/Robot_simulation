@@ -42,6 +42,20 @@ COMMANDS = {
     "stop":          {"stop": True},
     "reset":         {"reset": True},
     "state":         {"get_state": True},
+    "arms_up": {"arm_cmd": [
+    0.0,  0.0,  0.0,          # waist yaw, roll, pitch
+    0.5,  0.0,  0.0,  0.5,    # left shoulder + elbow
+    0.0,  0.0,  0.0,          # left wrist
+    0.0,  0.0,  0.0,          # left thumb
+    0.0,  0.0,                # left middle
+    0.0,  0.0,                # left index
+    -0.5, 0.0,  0.0, -0.5,   # right shoulder + elbow
+    0.0,  0.0,  0.0,          # right wrist
+    0.0,  0.0,  0.0,          # right thumb
+    0.0,  0.0,                # right index
+    0.0,  0.0,                # right middle
+]},
+"arms_zero": {"arm_cmd": [0.0] * 31},
 }
 
 
@@ -52,7 +66,6 @@ if __name__ == "__main__":
 
     command = sys.argv[1]
 
-    # Comando custom: python commander.py cmd 0.5 0.2 0.0
     if command == "cmd":
         if len(sys.argv) < 5:
             print("Uso: python commander.py cmd <vx> <vy> <vyaw>")
