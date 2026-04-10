@@ -1,11 +1,12 @@
 """
 Runner module - entry point for running the simulation.
+Uses factory to select the appropriate simulation class based on XML model.
 """
 
 import logging
 
 from config import load_config
-from simulation.simulation import Simulation
+from .factory import create_simulation
 
 # Configura logger root
 logging.basicConfig(
@@ -36,6 +37,7 @@ def run_simulation(is_server: bool = False) -> None:
     logger.info(f"Simulation config: dt={sim_cfg.simulation_dt}, decimation={sim_cfg.control_decimation}")
     logger.info(f"Control config: num_actions={ctrl_cfg.num_actions}")
     logger.info(f"Observation config: cmd_init={obs_cfg.cmd_init}")
+    logger.info(f"XML path: {sim_cfg.xml_path}")
 
     # Se server, ignora il cammino automatico iniziale
     if is_server:
@@ -44,9 +46,9 @@ def run_simulation(is_server: bool = False) -> None:
     else:
         logger.info(f"Modalità STANDALONE: comando iniziale = {obs_cfg.cmd_init}")
 
-    # Creazione istanza della simulazione
-    logger.info("Creazione istanza Simulation...")
-    sim = Simulation(sim_cfg, ctrl_cfg, obs_cfg, start_server=is_server)
+    # Creazione istanza della simulazione tramite factory
+    logger.info("Creazione istanza Simulation (factory)...")
+    sim = create_simulation(sim_cfg, ctrl_cfg, obs_cfg, start_server=is_server)
 
     # Avvio del loop principale
     logger.info("Avvio simulazione...\n")
