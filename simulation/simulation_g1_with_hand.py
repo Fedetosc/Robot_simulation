@@ -40,19 +40,14 @@ class SimulationG1WithHand:
 
         logger.info("Inizializzazione simulazione G1 With Hand (29 DOF)...")
 
-        # Conversione parametri - guadagni PD e angoli di default
         self.kps = np.array(ctrl_cfg.kps, dtype=np.float32)
         self.kds = np.array(ctrl_cfg.kds, dtype=np.float32)
         self.default_angles = np.array(ctrl_cfg.default_angles, dtype=np.float32)
         self.cmd_scale = np.array(obs_cfg.cmd_scale, dtype=np.float32)
         self.cmd = np.array(obs_cfg.cmd_init, dtype=np.float32)
 
-        logger.debug(f"KPS: {self.kps}")
-        logger.debug(f"KDS: {self.kds}")
-        logger.debug(f"Default angles: {self.default_angles}")
         logger.info(f"Comando iniziale: {self.cmd}")
 
-        # Variabili di stato
         self.action = np.zeros(ctrl_cfg.num_actions, dtype=np.float32)
         self.target_dof_pos = self.default_angles.copy()
         self.counter = 0
@@ -65,20 +60,35 @@ class SimulationG1WithHand:
         self.model = mujoco.MjModel.from_xml_path(sim_cfg.xml_path)
         self.data = mujoco.MjData(self.model)
         self.model.opt.timestep = sim_cfg.simulation_dt
+
+        # Reset pulito PRIMA di fare qualsiasi lettura
+        mujoco.mj_resetData(self.model, self.data)
+        # Posiziona le gambe nella posa di default
+        self.data.qpos[7:7+ctrl_cfg.num_actions] = ctrl_cfg.default_angles
+        # Posizione verticale corretta
+        self.data.qpos[2] = 0.793  # altezza pelvis dal MJCF (body pos z)
+        self.data.qpos[3:7] = [1, 0, 0, 0]  # quaternione identità (upright)
+        mujoco.mj_forward(self.model, self.data)
         logger.info(f"Modello caricato - Timestep: {self.model.opt.timestep}s")
 
-        # DOF totali dal modello
         self.total_dofs = self.model.nu
         logger.info(f"Numero totale attuatori: {self.total_dofs}")
 
-        # Nomi attuatori per identificare gambe vs braccia
+        # Nomi attuatori
         self.actuator_names = [
             mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
             for i in range(self.total_dofs)
         ]
         logger.info(f"Attuatori: {self.actuator_names}")
 
-        # Identifica indici delle gambe (contengono hip, knee, ankle)
+        # Mappa nome_joint -> indice in qpos (corretto, non dipende dall'ordine attuatori)
+        self.joint_name_to_qpos_idx = {}
+        for i in range(self.model.njnt):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, i)
+            if name:  # il floating base joint potrebbe avere nome vuoto
+                self.joint_name_to_qpos_idx[name] = self.model.jnt_qposadr[i]
+
+        # Indici gambe e resto
         leg_keywords = ["hip", "knee", "ankle"]
         self.leg_indices = np.array([
             i for i, name in enumerate(self.actuator_names)
@@ -88,10 +98,26 @@ class SimulationG1WithHand:
         logger.info(f"Leg indices ({len(self.leg_indices)}): {self.leg_indices}")
         logger.info(f"Other indices ({len(self.other_indices)}): {self.other_indices}")
 
-        # Target per tutti i DOF
+        # Indici mani vs braccia (per guadagni separati)
+        wrist_hand_keywords = ["hand", "wrist"]
+        self.hand_indices = np.array([
+            i for i in self.other_indices
+            if any(k in self.actuator_names[i] for k in wrist_hand_keywords)
+        ])
+        self.arm_indices = np.array([
+            i for i in self.other_indices
+            if i not in self.hand_indices
+        ])
+
+        # Target posizioni
         self.target_dof_pos_full = np.zeros(self.total_dofs, dtype=np.float32)
         self.target_dof_pos_full[self.leg_indices] = self.default_angles
+
+        # Leggi posizioni iniziali braccia/mani dalla qpos reale tramite mappa corretta
         self.arm_target = np.zeros(len(self.other_indices), dtype=np.float32)
+        self._read_arm_target_from_qpos()
+
+        logger.info(f"arm_target iniziale: {self.arm_target}")
 
         # Caricamento Policy RL
         logger.info(f"Caricamento policy RL da: {sim_cfg.policy_path}")
@@ -99,7 +125,6 @@ class SimulationG1WithHand:
         self.policy.eval()
         logger.info("Policy RL caricata e pronta")
 
-        # Avvio Server Socket se richiesto
         if start_server:
             self.host = "localhost"
             self.port = 9999
@@ -191,8 +216,20 @@ class SimulationG1WithHand:
         self.target_dof_pos = self.action * self.obs_cfg.action_scale + self.default_angles
         self.target_dof_pos_full[self.leg_indices] = self.target_dof_pos
 
+    def _read_arm_target_from_qpos(self) -> None:
+        """Legge le posizioni correnti di braccia/mani da qpos usando la mappa nome->idx."""
+        for k, act_idx in enumerate(self.other_indices):
+            joint_name = self.actuator_names[act_idx]
+            qpos_idx = self.joint_name_to_qpos_idx.get(joint_name)
+            if qpos_idx is not None:
+                self.arm_target[k] = self.data.qpos[qpos_idx]
+            else:
+                logger.warning(f"Joint '{joint_name}' non trovato nella mappa qpos, uso 0.0")
+                self.arm_target[k] = 0.0
+
     def step(self) -> None:
         """Passo di simulazione."""
+
         if self.stopped:
             self.data.qvel[:] = 0
             self.data.ctrl[:] = 0
@@ -203,19 +240,18 @@ class SimulationG1WithHand:
         current_q = self.data.qpos[7:7+self.total_dofs]
         current_dq = self.data.qvel[6:6+self.total_dofs]
 
+        # Guadagni PD
         kp_full = np.zeros(self.total_dofs, dtype=np.float32)
         kd_full = np.zeros(self.total_dofs, dtype=np.float32)
 
-        if np.linalg.norm(self.cmd) > 0.05:
-            kp_full[self.leg_indices] = self.kps
-            kd_full[self.leg_indices] = self.kds
-        else:
-            kp_full[self.leg_indices] = self.kps
-            kd_full[self.leg_indices] = self.kds
+        kp_full[self.leg_indices] = self.kps
+        kd_full[self.leg_indices] = self.kds
+        kp_full[self.arm_indices] = 80.0
+        kd_full[self.arm_indices] = 5.0
+        kp_full[self.hand_indices] = 5.0
+        kd_full[self.hand_indices] = 1.0
 
-        # Braccia/mani: guadagni fissi
-        kp_full[self.other_indices] = 80.0
-        kd_full[self.other_indices] = 5.0
+        # Applica target braccia/mani
         self.target_dof_pos_full[self.other_indices] = self.arm_target
 
         self.data.ctrl[:self.total_dofs] = pd_control(
@@ -228,26 +264,27 @@ class SimulationG1WithHand:
         )
 
         mujoco.mj_step(self.model, self.data)
+
         if self.counter % 200 == 0:
             self.debug_joints()
             self.debug_arms()
-        self.counter += 1
 
+        self.counter += 1
 
         # Update policy ogni control_decimation step
         if self.counter % self.sim_cfg.control_decimation == 0:
             if np.linalg.norm(self.cmd) > 0.05:
                 self._update_policy()
             else:
-                # Reset stato quando fermo
-                self.data.qvel[:] = 0
-                self.data.qacc[:] = 0
-                self.data.qfrc_applied[:] = 0
-                self.data.qpos[3:7] = [1, 0, 0, 0]
+                mujoco.mj_resetData(self.model, self.data)
+                # Reimposta posa default gambe
                 self.data.qpos[7:7+self.ctrl_cfg.num_actions] = self.default_angles
+                self.data.qpos[2] = 0.793
+                self.data.qpos[3:7] = [1, 0, 0, 0]
+                mujoco.mj_forward(self.model, self.data)
                 self.target_dof_pos = self.default_angles.copy()
                 self.target_dof_pos_full[self.leg_indices] = self.default_angles
-                mujoco.mj_forward(self.model, self.data)
+                self._read_arm_target_from_qpos()
 
     def run(self) -> None:
         """Loop principale con visualizzatore."""
