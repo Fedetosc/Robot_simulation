@@ -55,17 +55,3 @@ def run_simulation(is_server: bool = False) -> None:
     sim.run()
 
     logger.info("=== Simulazione terminata ===\n")
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Avvia la simulazione del robot quadrupede")
-    parser.add_argument(
-        "--server",
-        action="store_true",
-        help="Avvia il server socket per ricevere comandi esterni"
-    )
-    args = parser.parse_args()
-
-    run_simulation(is_server=args.server)

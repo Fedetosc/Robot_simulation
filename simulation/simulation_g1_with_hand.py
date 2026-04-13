@@ -228,7 +228,11 @@ class SimulationG1WithHand:
         )
 
         mujoco.mj_step(self.model, self.data)
+        if self.counter % 200 == 0:
+            self.debug_joints()
+            self.debug_arms()
         self.counter += 1
+
 
         # Update policy ogni control_decimation step
         if self.counter % self.sim_cfg.control_decimation == 0:
@@ -267,3 +271,22 @@ class SimulationG1WithHand:
                     time.sleep(self.model.opt.timestep - elapsed)
 
             logger.info("Simulazione terminata")
+
+    def debug_joints(self):
+        q = self.data.qpos[7:7+self.total_dofs]
+        dq = self.data.qvel[6:6+self.total_dofs]
+        tau = self.data.ctrl[:self.total_dofs]
+
+        print("\n=== JOINT DEBUG ===")
+        for i, name in enumerate(self.actuator_names):
+            print(f"{i:02d} | {name:30} | "
+                f"q={q[i]: .3f} | dq={dq[i]: .3f} | tau={tau[i]: .3f}")
+            
+    def debug_arms(self):
+        q = self.data.qpos[7:7+self.total_dofs]
+        dq = self.data.qvel[6:6+self.total_dofs]
+
+        print("\n=== ARMS DEBUG ===")
+        for i in self.other_indices:
+            print(f"{i:02d} | {self.actuator_names[i]:30} | "
+                f"q={q[i]: .3f} | dq={dq[i]: .3f}")
